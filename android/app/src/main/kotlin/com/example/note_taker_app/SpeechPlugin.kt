@@ -1,9 +1,14 @@
 package com.example.note_taker_app
 
+import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -12,6 +17,7 @@ import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.util.Log
+import androidx.core.content.ContextCompat
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
@@ -24,6 +30,7 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
         private const val CHANNEL = "speech_continuous"
         private const val RESTART_DELAY_MS = 50L
         private const val STOP_UNMUTE_DELAY_MS = 2000L
+        private const val SAMPLE_RATE = 16000
     }
 
     private lateinit var channel: EventChannel
@@ -33,6 +40,10 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
     private var shouldContinue = false
     private var isOnDevice = false
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    // AudioRecord keeps the mic indicator steady (no flicker between restarts)
+    private var audioRecord: AudioRecord? = null
+    private var audioThread: Thread? = null
 
     // Store original volumes
     private var savedMusicVol = -1
@@ -56,6 +67,7 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
 
     override fun onDetachedFromActivity() {
         shouldContinue = false
+        stopAudioRecord()
         destroyRecognizer()
         restoreVolumeNow()
         activity = null
@@ -76,6 +88,8 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
         shouldContinue = true
         activity?.runOnUiThread {
             muteAllStreams()
+            // Start AudioRecord first to hold the mic indicator steady
+            startAudioRecord()
             initRecognizerAndStart()
         }
     }
@@ -86,11 +100,85 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
             ensureMuted()
             speechRecognizer?.stopListening()
             destroyRecognizer()
+            stopAudioRecord()
             mainHandler.postDelayed({
                 restoreVolumeNow()
             }, STOP_UNMUTE_DELAY_MS)
         }
         eventSink = null
+    }
+
+    // --- AudioRecord: keeps mic open to prevent notification icon flicker ---
+
+    private fun startAudioRecord() {
+        val act = activity ?: return
+        if (ContextCompat.checkSelfPermission(act, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED) {
+            Log.w(TAG, "No RECORD_AUDIO permission for AudioRecord")
+            return
+        }
+
+        val bufferSize = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+
+        if (bufferSize == AudioRecord.ERROR || bufferSize == AudioRecord.ERROR_BAD_VALUE) {
+            Log.w(TAG, "Invalid AudioRecord buffer size")
+            return
+        }
+
+        try {
+            audioRecord = AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufferSize
+            )
+
+            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                Log.w(TAG, "AudioRecord failed to initialize")
+                audioRecord?.release()
+                audioRecord = null
+                return
+            }
+
+            audioRecord?.startRecording()
+            Log.d(TAG, "AudioRecord started (mic anchor)")
+
+            // Read in background thread to keep the stream alive
+            audioThread = Thread {
+                val buffer = ByteArray(bufferSize)
+                while (shouldContinue && audioRecord != null) {
+                    try {
+                        audioRecord?.read(buffer, 0, buffer.size)
+                    } catch (e: Exception) {
+                        break
+                    }
+                }
+            }.apply {
+                isDaemon = true
+                start()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to start AudioRecord: ${e.message}")
+            audioRecord?.release()
+            audioRecord = null
+        }
+    }
+
+    private fun stopAudioRecord() {
+        try {
+            shouldContinue = false // signal thread to stop
+            audioRecord?.stop()
+            audioRecord?.release()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error stopping AudioRecord: ${e.message}")
+        }
+        audioRecord = null
+        audioThread = null
     }
 
     // --- Core speech logic ---
@@ -117,7 +205,6 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
 
             when (error) {
                 SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> {
-                    // Recognizer is busy — destroy and recreate
                     mainHandler.postDelayed({
                         if (shouldContinue) {
                             activity?.runOnUiThread {
@@ -128,8 +215,6 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
                     }, 500L)
                 }
                 else -> {
-                    // For NO_MATCH, SPEECH_TIMEOUT, and others — just restart listening
-                    // on the same instance (no destroy/recreate = no mic icon flicker)
                     mainHandler.postDelayed({
                         if (shouldContinue) {
                             activity?.runOnUiThread { startListening() }
@@ -147,7 +232,6 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
                     eventSink?.success(mapOf("type" to "final", "text" to texts[0]))
                 }
             }
-            // Restart listening on same instance — no flicker
             if (shouldContinue) {
                 mainHandler.postDelayed({
                     if (shouldContinue) {
@@ -176,8 +260,6 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
         destroyRecognizer()
         ensureMuted()
 
-        // Try on-device recognizer first (SODA) — available on Android 12+ (API 31)
-        // On-device = no network, faster, and typically no beep
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
             SpeechRecognizer.isOnDeviceRecognitionAvailable(act)) {
             Log.d(TAG, "Using ON-DEVICE recognizer (SODA)")
@@ -212,7 +294,6 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
             Log.d(TAG, "Started listening")
         } catch (e: Exception) {
             Log.e(TAG, "Error starting listener: ${e.message}")
-            // If startListening fails, recreate
             mainHandler.postDelayed({
                 if (shouldContinue) {
                     activity?.runOnUiThread { initRecognizerAndStart() }
