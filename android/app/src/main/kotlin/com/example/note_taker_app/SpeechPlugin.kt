@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.media.AudioManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -21,8 +22,7 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
     companion object {
         private const val TAG = "SpeechPlugin"
         private const val CHANNEL = "speech_continuous"
-        private const val RESTART_DELAY_MS = 100L
-        // Delay before restoring volume after stopping (covers the stop beep)
+        private const val RESTART_DELAY_MS = 50L
         private const val STOP_UNMUTE_DELAY_MS = 2000L
     }
 
@@ -31,9 +31,10 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
     private var speechRecognizer: SpeechRecognizer? = null
     private var activity: Activity? = null
     private var shouldContinue = false
+    private var isOnDevice = false
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // Store original volumes to restore only when user stops
+    // Store original volumes
     private var savedMusicVol = -1
     private var savedNotifVol = -1
     private var savedRingVol = -1
@@ -74,20 +75,17 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
         eventSink = sink
         shouldContinue = true
         activity?.runOnUiThread {
-            // Mute ONCE when user taps start — stays muted the entire session
             muteAllStreams()
-            createAndStart()
+            initRecognizerAndStart()
         }
     }
 
     override fun onCancel(arguments: Any?) {
         shouldContinue = false
         activity?.runOnUiThread {
-            // Ensure muted before stopping so the stop beep is silent
-            muteAllStreams()
+            ensureMuted()
             speechRecognizer?.stopListening()
             destroyRecognizer()
-            // Restore volume after a delay to cover the stop beep
             mainHandler.postDelayed({
                 restoreVolumeNow()
             }, STOP_UNMUTE_DELAY_MS)
@@ -97,93 +95,129 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
 
     // --- Core speech logic ---
 
-    private fun createAndStart() {
+    private val recognitionListener = object : RecognitionListener {
+        override fun onReadyForSpeech(params: Bundle?) {
+            Log.d(TAG, "Ready for speech (onDevice=$isOnDevice)")
+        }
+
+        override fun onBeginningOfSpeech() {
+            Log.d(TAG, "Speech started")
+        }
+
+        override fun onRmsChanged(rmsdB: Float) {}
+        override fun onBufferReceived(buffer: ByteArray?) {}
+
+        override fun onEndOfSpeech() {
+            Log.d(TAG, "End of speech")
+        }
+
+        override fun onError(error: Int) {
+            Log.w(TAG, "Error: $error")
+            if (!shouldContinue) return
+
+            when (error) {
+                SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> {
+                    // Recognizer is busy — destroy and recreate
+                    mainHandler.postDelayed({
+                        if (shouldContinue) {
+                            activity?.runOnUiThread {
+                                destroyRecognizer()
+                                initRecognizerAndStart()
+                            }
+                        }
+                    }, 500L)
+                }
+                else -> {
+                    // For NO_MATCH, SPEECH_TIMEOUT, and others — just restart listening
+                    // on the same instance (no destroy/recreate = no mic icon flicker)
+                    mainHandler.postDelayed({
+                        if (shouldContinue) {
+                            activity?.runOnUiThread { startListening() }
+                        }
+                    }, RESTART_DELAY_MS)
+                }
+            }
+        }
+
+        override fun onResults(results: Bundle?) {
+            val texts = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            Log.d(TAG, "Final results: $texts")
+            if (!texts.isNullOrEmpty()) {
+                mainHandler.post {
+                    eventSink?.success(mapOf("type" to "final", "text" to texts[0]))
+                }
+            }
+            // Restart listening on same instance — no flicker
+            if (shouldContinue) {
+                mainHandler.postDelayed({
+                    if (shouldContinue) {
+                        activity?.runOnUiThread { startListening() }
+                    }
+                }, RESTART_DELAY_MS)
+            }
+        }
+
+        override fun onPartialResults(partialResults: Bundle?) {
+            val texts = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            if (!texts.isNullOrEmpty()) {
+                mainHandler.post {
+                    eventSink?.success(mapOf("type" to "partial", "text" to texts[0]))
+                }
+            }
+        }
+
+        override fun onEvent(eventType: Int, params: Bundle?) {}
+    }
+
+    private fun initRecognizerAndStart() {
         val act = activity ?: return
         if (!shouldContinue) return
 
-        // Destroy previous instance cleanly
         destroyRecognizer()
-
-        // Ensure still muted before each restart (no unmute between sessions)
         ensureMuted()
 
-        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(act).also { recognizer ->
-            recognizer.setRecognitionListener(object : RecognitionListener {
-                override fun onReadyForSpeech(params: Bundle?) {
-                    Log.d(TAG, "Ready for speech")
-                    // Do NOT unmute here — stay muted the entire session
-                }
+        // Try on-device recognizer first (SODA) — available on Android 12+ (API 31)
+        // On-device = no network, faster, and typically no beep
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            SpeechRecognizer.isOnDeviceRecognitionAvailable(act)) {
+            Log.d(TAG, "Using ON-DEVICE recognizer (SODA)")
+            speechRecognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(act)
+            isOnDevice = true
+        } else {
+            Log.d(TAG, "On-device not available, using default recognizer")
+            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(act)
+            isOnDevice = false
+        }
 
-                override fun onBeginningOfSpeech() {
-                    Log.d(TAG, "Speech started")
-                }
+        speechRecognizer?.setRecognitionListener(recognitionListener)
+        startListening()
+    }
 
-                override fun onRmsChanged(rmsdB: Float) {}
-                override fun onBufferReceived(buffer: ByteArray?) {}
+    private fun startListening() {
+        if (speechRecognizer == null || !shouldContinue) return
+        ensureMuted()
 
-                override fun onEndOfSpeech() {
-                    Log.d(TAG, "End of speech")
-                }
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "fr-FR")
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "fr-FR")
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 8000L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 8000L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 500L)
+        }
 
-                override fun onError(error: Int) {
-                    Log.w(TAG, "Error: $error")
-                    if (shouldContinue) {
-                        val delay = when (error) {
-                            SpeechRecognizer.ERROR_NO_MATCH,
-                            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> RESTART_DELAY_MS
-                            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> 500L
-                            else -> 300L
-                        }
-                        mainHandler.postDelayed({
-                            if (shouldContinue) {
-                                activity?.runOnUiThread { createAndStart() }
-                            }
-                        }, delay)
-                    }
-                }
-
-                override fun onResults(results: Bundle?) {
-                    val texts = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    Log.d(TAG, "Final results: $texts")
-                    if (!texts.isNullOrEmpty()) {
-                        mainHandler.post {
-                            eventSink?.success(mapOf("type" to "final", "text" to texts[0]))
-                        }
-                    }
-                    if (shouldContinue) {
-                        mainHandler.postDelayed({
-                            if (shouldContinue) {
-                                activity?.runOnUiThread { createAndStart() }
-                            }
-                        }, RESTART_DELAY_MS)
-                    }
-                }
-
-                override fun onPartialResults(partialResults: Bundle?) {
-                    val texts = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    if (!texts.isNullOrEmpty()) {
-                        mainHandler.post {
-                            eventSink?.success(mapOf("type" to "partial", "text" to texts[0]))
-                        }
-                    }
-                }
-
-                override fun onEvent(eventType: Int, params: Bundle?) {}
-            })
-
-            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "fr-FR")
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "fr-FR")
-                putExtra(RecognizerIntent.EXTRA_ONLY_RETURN_DEFAULTS_ON_ERROR, true)
-                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 8000L)
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 8000L)
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 500L)
-            }
-
-            recognizer.startListening(intent)
+        try {
+            speechRecognizer?.startListening(intent)
             Log.d(TAG, "Started listening")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error starting listener: ${e.message}")
+            // If startListening fails, recreate
+            mainHandler.postDelayed({
+                if (shouldContinue) {
+                    activity?.runOnUiThread { initRecognizerAndStart() }
+                }
+            }, 300L)
         }
     }
 
@@ -197,15 +231,12 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
     }
 
     // --- Audio muting for beep suppression ---
-    // Strategy: mute when user starts, stay muted the ENTIRE session, restore only when user stops.
-    // This eliminates all beeps between restarts since volume is never restored mid-session.
 
     private fun muteAllStreams() {
         val act = activity ?: return
         val am = act.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
         if (!isMuted) {
-            // Save current volumes only once
             savedMusicVol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
             savedNotifVol = am.getStreamVolume(AudioManager.STREAM_NOTIFICATION)
             savedRingVol = am.getStreamVolume(AudioManager.STREAM_RING)
@@ -224,8 +255,6 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
             muteAllStreams()
             return
         }
-        // Already muted — just make sure streams are still at 0
-        // (some devices/apps can change volume externally)
         val act = activity ?: return
         val am = act.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
