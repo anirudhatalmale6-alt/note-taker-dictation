@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -24,14 +25,14 @@ class DictationPage extends StatefulWidget {
 
 class _DictationPageState extends State<DictationPage> {
   static const _channel = EventChannel('speech_continuous');
-  Stream<dynamic>? _stream;
+  StreamSubscription<dynamic>? _subscription;
   bool _isListening = false;
   String _accumulated = '';
   String _current = '';
 
   void _start() {
-    _stream = _channel.receiveBroadcastStream();
-    _stream!.listen((event) {
+    final stream = _channel.receiveBroadcastStream();
+    _subscription = stream.listen((event) {
       final map = Map<String, dynamic>.from(event);
       final type = map['type'] as String;
       final text = map['text'] as String? ?? '';
@@ -45,6 +46,7 @@ class _DictationPageState extends State<DictationPage> {
       });
     }, onError: (e) {
       setState(() => _isListening = false);
+      _subscription = null;
     });
     setState(() {
       _isListening = true;
@@ -59,9 +61,16 @@ class _DictationPageState extends State<DictationPage> {
       _accumulated += (_accumulated.isEmpty ? '' : ' ') + _current;
       _current = '';
     }
+    // Cancel the subscription — this triggers onCancel in the Kotlin plugin
+    _subscription?.cancel();
+    _subscription = null;
     setState(() => _isListening = false);
-    // Cancel the stream which triggers onCancel in Kotlin plugin
-    _stream = null;
+  }
+
+  @override
+  void dispose() {
+    _subscription?.cancel();
+    super.dispose();
   }
 
   void _toggle() {
