@@ -21,10 +21,9 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
     companion object {
         private const val TAG = "SpeechPlugin"
         private const val CHANNEL = "speech_continuous"
-        // Restart delay kept minimal for seamless experience
         private const val RESTART_DELAY_MS = 100L
-        // How long to keep audio muted after starting recognition (covers the beep window)
-        private const val MUTE_DURATION_MS = 1500L
+        // Delay before restoring volume after stopping (covers the stop beep)
+        private const val STOP_UNMUTE_DELAY_MS = 2000L
     }
 
     private lateinit var channel: EventChannel
@@ -34,7 +33,7 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
     private var shouldContinue = false
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // Store original volumes to restore later
+    // Store original volumes to restore only when user stops
     private var savedMusicVol = -1
     private var savedNotifVol = -1
     private var savedRingVol = -1
@@ -57,7 +56,7 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
     override fun onDetachedFromActivity() {
         shouldContinue = false
         destroyRecognizer()
-        restoreVolume()
+        restoreVolumeNow()
         activity = null
     }
 
@@ -75,6 +74,8 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
         eventSink = sink
         shouldContinue = true
         activity?.runOnUiThread {
+            // Mute ONCE when user taps start — stays muted the entire session
+            muteAllStreams()
             createAndStart()
         }
     }
@@ -82,9 +83,14 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
     override fun onCancel(arguments: Any?) {
         shouldContinue = false
         activity?.runOnUiThread {
+            // Ensure muted before stopping so the stop beep is silent
+            muteAllStreams()
             speechRecognizer?.stopListening()
             destroyRecognizer()
-            restoreVolume()
+            // Restore volume after a delay to cover the stop beep
+            mainHandler.postDelayed({
+                restoreVolumeNow()
+            }, STOP_UNMUTE_DELAY_MS)
         }
         eventSink = null
     }
@@ -98,15 +104,14 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
         // Destroy previous instance cleanly
         destroyRecognizer()
 
-        // Mute all audio streams BEFORE creating recognizer to suppress beep
-        muteAllStreams()
+        // Ensure still muted before each restart (no unmute between sessions)
+        ensureMuted()
 
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(act).also { recognizer ->
             recognizer.setRecognitionListener(object : RecognitionListener {
                 override fun onReadyForSpeech(params: Bundle?) {
                     Log.d(TAG, "Ready for speech")
-                    // Schedule unmute after beep window passes
-                    scheduleUnmute()
+                    // Do NOT unmute here — stay muted the entire session
                 }
 
                 override fun onBeginningOfSpeech() {
@@ -122,9 +127,6 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
 
                 override fun onError(error: Int) {
                     Log.w(TAG, "Error: $error")
-                    // Error 6 = SPEECH_TIMEOUT, 7 = NO_MATCH — these are normal "silence" events
-                    // Error 8 = RECOGNIZER_BUSY — need to recreate
-                    // Error 9 = INSUFFICIENT_PERMISSIONS
                     if (shouldContinue) {
                         val delay = when (error) {
                             SpeechRecognizer.ERROR_NO_MATCH,
@@ -148,7 +150,6 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
                             eventSink?.success(mapOf("type" to "final", "text" to texts[0]))
                         }
                     }
-                    // Restart immediately for continuous listening
                     if (shouldContinue) {
                         mainHandler.postDelayed({
                             if (shouldContinue) {
@@ -170,14 +171,12 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
                 override fun onEvent(eventType: Int, params: Bundle?) {}
             })
 
-            // Build recognition intent
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, "fr-FR")
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "fr-FR")
                 putExtra(RecognizerIntent.EXTRA_ONLY_RETURN_DEFAULTS_ON_ERROR, true)
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                // Long silence tolerance (8 seconds)
                 putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 8000L)
                 putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 8000L)
                 putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 500L)
@@ -198,20 +197,21 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
     }
 
     // --- Audio muting for beep suppression ---
+    // Strategy: mute when user starts, stay muted the ENTIRE session, restore only when user stops.
+    // This eliminates all beeps between restarts since volume is never restored mid-session.
 
     private fun muteAllStreams() {
         val act = activity ?: return
         val am = act.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
         if (!isMuted) {
-            // Save current volumes
+            // Save current volumes only once
             savedMusicVol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
             savedNotifVol = am.getStreamVolume(AudioManager.STREAM_NOTIFICATION)
             savedRingVol = am.getStreamVolume(AudioManager.STREAM_RING)
             savedSystemVol = am.getStreamVolume(AudioManager.STREAM_SYSTEM)
         }
 
-        // Mute all streams that could produce the beep
         am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
         am.setStreamVolume(AudioManager.STREAM_NOTIFICATION, 0, 0)
         am.setStreamVolume(AudioManager.STREAM_RING, 0, 0)
@@ -219,13 +219,22 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, EventChannel.StreamHandler {
         isMuted = true
     }
 
-    private fun scheduleUnmute() {
-        mainHandler.postDelayed({
-            restoreVolume()
-        }, MUTE_DURATION_MS)
+    private fun ensureMuted() {
+        if (!isMuted) {
+            muteAllStreams()
+            return
+        }
+        // Already muted — just make sure streams are still at 0
+        // (some devices/apps can change volume externally)
+        val act = activity ?: return
+        val am = act.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+        am.setStreamVolume(AudioManager.STREAM_NOTIFICATION, 0, 0)
+        am.setStreamVolume(AudioManager.STREAM_RING, 0, 0)
+        am.setStreamVolume(AudioManager.STREAM_SYSTEM, 0, 0)
     }
 
-    private fun restoreVolume() {
+    private fun restoreVolumeNow() {
         if (!isMuted) return
         val act = activity ?: return
         val am = act.getSystemService(Context.AUDIO_SERVICE) as AudioManager
