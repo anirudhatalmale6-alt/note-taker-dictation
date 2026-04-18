@@ -23,12 +23,27 @@ class DictationPage extends StatefulWidget {
   State<DictationPage> createState() => _DictationPageState();
 }
 
-class _DictationPageState extends State<DictationPage> {
+class _DictationPageState extends State<DictationPage> with SingleTickerProviderStateMixin {
   static const _channel = EventChannel('speech_continuous');
   StreamSubscription<dynamic>? _subscription;
   bool _isListening = false;
   String _accumulated = '';
   String _current = '';
+
+  late final AnimationController _pulseController;
+  late final Animation<double> _pulseAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1200),
+    );
+    _pulseAnimation = Tween<double>(begin: 1.0, end: 1.15).animate(
+      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+    );
+  }
 
   void _start() {
     final stream = _channel.receiveBroadcastStream();
@@ -48,6 +63,7 @@ class _DictationPageState extends State<DictationPage> {
       setState(() => _isListening = false);
       _subscription = null;
     });
+    _pulseController.repeat(reverse: true);
     setState(() {
       _isListening = true;
       _accumulated = '';
@@ -64,12 +80,15 @@ class _DictationPageState extends State<DictationPage> {
     // Cancel the subscription — this triggers onCancel in the Kotlin plugin
     _subscription?.cancel();
     _subscription = null;
+    _pulseController.stop();
+    _pulseController.reset();
     setState(() => _isListening = false);
   }
 
   @override
   void dispose() {
     _subscription?.cancel();
+    _pulseController.dispose();
     super.dispose();
   }
 
@@ -177,31 +196,40 @@ class _DictationPageState extends State<DictationPage> {
             ),
           ),
           const SizedBox(height: 24),
-          // Start/Stop button
+          // Start/Stop button with pulse animation
           GestureDetector(
             onTap: _toggle,
-            child: Container(
-              width: 88,
-              height: 88,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: isActive ? const Color(0xFFC8431A) : Colors.white,
-                border: Border.all(color: const Color(0xFFC8431A), width: 3),
-                boxShadow: isActive
-                    ? [
-                        BoxShadow(
-                          color: const Color(0xFFC8431A).withOpacity(0.3),
-                          blurRadius: 20,
-                          spreadRadius: 4,
-                        ),
-                      ]
-                    : null,
-              ),
-              child: Icon(
-                isActive ? Icons.stop_rounded : Icons.mic,
-                size: 40,
-                color: isActive ? Colors.white : const Color(0xFFC8431A),
-              ),
+            child: AnimatedBuilder(
+              animation: _pulseAnimation,
+              builder: (context, child) {
+                final scale = isActive ? _pulseAnimation.value : 1.0;
+                return Transform.scale(
+                  scale: scale,
+                  child: Container(
+                    width: 88,
+                    height: 88,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: isActive ? const Color(0xFFC8431A) : Colors.white,
+                      border: Border.all(color: const Color(0xFFC8431A), width: 3),
+                      boxShadow: isActive
+                          ? [
+                              BoxShadow(
+                                color: const Color(0xFFC8431A).withOpacity(0.3),
+                                blurRadius: 20 * scale,
+                                spreadRadius: 4 * scale,
+                              ),
+                            ]
+                          : null,
+                    ),
+                    child: Icon(
+                      isActive ? Icons.stop_rounded : Icons.mic,
+                      size: 40,
+                      color: isActive ? Colors.white : const Color(0xFFC8431A),
+                    ),
+                  ),
+                );
+              },
             ),
           ),
           const SizedBox(height: 40),
